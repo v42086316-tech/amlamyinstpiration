@@ -471,8 +471,9 @@ active_voice_sessions = {}
 # NEW: lightweight in-memory game/lookup state -- lost on restart like the
 # other active_* dicts in this bot (active_impersonations, etc), which is an
 # acceptable tradeoff for stuff like "what was the last deleted message".
-last_deleted_message = {}   # channel_id -> {content, author_id, author_name, author_avatar, attachments, deleted_at}
-last_edited_message = {}    # channel_id -> {before, after, author_id, author_name, author_avatar, edited_at}
+last_deleted_message = {}   # channel_id -> list (newest first, max SNIPE_HISTORY_SIZE) of {content, author_id, author_name, author_avatar, attachments, deleted_at}
+last_edited_message = {}    # channel_id -> list (newest first, max SNIPE_HISTORY_SIZE) of {before, after, author_id, author_name, author_avatar, edited_at}
+SNIPE_HISTORY_SIZE = 5
 active_wordchains = {}      # channel_id -> {"last_word": str, "length": int, "used_words": set}
 active_whodunits = {}       # channel_id -> {"murderer_id": int, "suspects": set[int], "guessed_correctly": set[int], "resolved": bool}
 
@@ -2135,14 +2136,16 @@ async def on_message_delete(message):
     # whether it turns out to be a ghost ping or a mod-log-worthy delete --
     # this is just a simple "what did I just miss" lookup.
     if message.content.strip() or message.attachments:
-        last_deleted_message[message.channel.id] = {
+        history_list = last_deleted_message.setdefault(message.channel.id, [])
+        history_list.insert(0, {
             "content": message.content,
             "author_id": message.author.id,
             "author_name": message.author.display_name,
             "author_avatar": message.author.display_avatar.url,
             "attachments": [a.url for a in message.attachments],
             "deleted_at": now.isoformat(),
-        }
+        })
+        del history_list[SNIPE_HISTORY_SIZE:]
 
     # NEW: logs messages a MODERATOR deleted (via Discord's audit log) to the
     # mod-log channel. Deliberately only fires when the audit log confirms a
@@ -2216,14 +2219,16 @@ async def on_message_edit(before, after):
     # when the text actually changed (an embed-load edit or similar with
     # identical content isn't useful to show someone).
     if before.content.strip() and before.content != after.content:
-        last_edited_message[before.channel.id] = {
+        edit_list = last_edited_message.setdefault(before.channel.id, [])
+        edit_list.insert(0, {
             "before": before.content,
             "after": after.content,
             "author_id": before.author.id,
             "author_name": before.author.display_name,
             "author_avatar": before.author.display_avatar.url,
             "edited_at": datetime.now(timezone.utc).isoformat(),
-        }
+        })
+        del edit_list[SNIPE_HISTORY_SIZE:]
 
     if before.mentions and not after.mentions:
         # UPDATED: per-server configurable, see on_message_delete above.
@@ -8210,34 +8215,37 @@ async def resize_pfp(ctx):
 # --------------------------------------------------------
 # 🔍 SNIPE / EDITSNIPE
 # --------------------------------------------------------
-@bot.command(name="snipe", help="Shows the most recently deleted message in this channel.")
+@bot.command(name="snipe", help="Shows the last 5 deleted messages in this channel (newest first).")
 async def snipe(ctx):
-    data = last_deleted_message.get(ctx.channel.id)
-    if not data:
+    entries = last_deleted_message.get(ctx.channel.id)
+    if not entries:
         return await ctx.send("📭 Nothing to snipe -- no deleted messages remembered in this channel since I last restarted.")
-    embed = discord.Embed(
-        description=data["content"] or "*(no text, attachment only)*",
-        color=discord.Color.red(),
-        timestamp=datetime.fromisoformat(data["deleted_at"])
-    )
-    embed.set_author(name=data["author_name"], icon_url=data["author_avatar"])
-    if data["attachments"]:
-        embed.add_field(name="Attachments", value="\n".join(data["attachments"][:5]), inline=False)
-        if data["attachments"][0].lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-            embed.set_image(url=data["attachments"][0])
-    embed.set_footer(text="Deleted")
+    embed = discord.Embed(title=f"🔍 Last {len(entries)} Deleted Message{'s' if len(entries) != 1 else ''}", color=discord.Color.red())
+    for i, data in enumerate(entries, 1):
+        deleted_at = datetime.fromisoformat(data["deleted_at"])
+        text = truncate_text(data["content"], 600) if data["content"] else "*(no text, attachment only)*"
+        if data["attachments"]:
+            text += "\n📎 " + "\n📎 ".join(data["attachments"][:2])
+        embed.add_field(
+            name=f"#{i} • {data['author_name']} • <t:{int(deleted_at.timestamp())}:R>",
+            value=truncate_text(text, 1000),
+            inline=False
+        )
     await ctx.send(embed=embed)
 
-@bot.command(name="editsnipe", aliases=["esnipe"], help="Shows the most recently edited message in this channel (before → after).")
+@bot.command(name="editsnipe", aliases=["esnipe"], help="Shows the last 5 edited messages in this channel (newest first, before → after).")
 async def editsnipe(ctx):
-    data = last_edited_message.get(ctx.channel.id)
-    if not data:
+    entries = last_edited_message.get(ctx.channel.id)
+    if not entries:
         return await ctx.send("📭 Nothing to editsnipe -- no edited messages remembered in this channel since I last restarted.")
-    embed = discord.Embed(color=discord.Color.orange(), timestamp=datetime.fromisoformat(data["edited_at"]))
-    embed.set_author(name=data["author_name"], icon_url=data["author_avatar"])
-    embed.add_field(name="Before", value=truncate_text(data["before"], 1000), inline=False)
-    embed.add_field(name="After", value=truncate_text(data["after"], 1000), inline=False)
-    embed.set_footer(text="Edited")
+    embed = discord.Embed(title=f"✏️ Last {len(entries)} Edited Message{'s' if len(entries) != 1 else ''}", color=discord.Color.orange())
+    for i, data in enumerate(entries, 1):
+        edited_at = datetime.fromisoformat(data["edited_at"])
+        embed.add_field(
+            name=f"#{i} • {data['author_name']} • <t:{int(edited_at.timestamp())}:R>",
+            value=truncate_text(f"**Before:** {truncate_text(data['before'], 400)}\n**After:** {truncate_text(data['after'], 400)}", 1000),
+            inline=False
+        )
     await ctx.send(embed=embed)
 
 # --------------------------------------------------------
@@ -8524,8 +8532,8 @@ class HelpView(ui.View):
         embed.add_field(name="`?resizepfp` (attach an image)", value="Fits an attached image into Discord's square avatar shape with no cropping and no stretching -- fills the leftover space with a blurred version of the same image instead of a blank background. Works in DM too.", inline=False)
         embed.add_field(name="`?dmbot <server_id> [channel_id]` / `?dmbot off`", value="Run in DM with the bot (server Administrators only): everything you DM the bot afterward gets posted into that server's channel.", inline=False)
         embed.add_field(name="`?welcometest`", value="[Mods only] Fires a test welcome message in the configured welcome channel.", inline=False)
-        embed.add_field(name="`?snipe`", value="Shows the most recently deleted message in this channel.", inline=False)
-        embed.add_field(name="`?editsnipe` (`?esnipe`)", value="Shows the most recently edited message in this channel (before → after).", inline=False)
+        embed.add_field(name="`?snipe`", value="Shows the last 5 deleted messages in this channel (newest first).", inline=False)
+        embed.add_field(name="`?editsnipe` (`?esnipe`)", value="Shows the last 5 edited messages in this channel (before → after, newest first).", inline=False)
         embed.add_field(name="`?firstmessage` (`?fm`) `[user]`", value="Jumps to the first message in this channel, or the first message a specific user sent here.", inline=False)
         return embed
 
